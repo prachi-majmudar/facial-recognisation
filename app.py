@@ -1,113 +1,45 @@
 import streamlit as st
-from deepface import DeepFace
+import face_recognition
 import cv2
 import numpy as np
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
-from PIL import Image
-import tempfile
-import os
-import pandas as pd
-from datetime import datetime
 
-# Enhance image for better detection
-def enhance_image(image):
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    merged = cv2.merge((cl, a, b))
-    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-
-# App title and instructions
-st.set_page_config(page_title="Face Verification App", layout="centered")
-st.title("🔒 Live Facial Recognition")
-st.markdown("Upload a reference face image and verify your identity via webcam using `DeepFace` + `ArcFace`. All verifications are logged.\n\nMake sure your face is clearly visible and well-lit.")
+st.title("Live Facial Recognition App")
+st.markdown("Upload a reference image and press the button to start recognition.")
 
 # Upload reference image
-uploaded_ref = st.file_uploader("📁 Upload Reference Image", type=["jpg", "jpeg", "png"])
+reference_image_file = st.file_uploader("Upload Reference Face", type=["jpg", "jpeg", "png"])
+start_recognition = st.button("Start Live Face Recognition")
 
-if uploaded_ref:
-    ref_img = Image.open(uploaded_ref).convert("RGB")
-    st.image(ref_img, caption="🧾 Reference Image", use_column_width=True)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as ref_file:
-        ref_img.save(ref_file.name)
-        ref_path = ref_file.name
-
-    # Extract face from reference image
-    ref_faces = DeepFace.extract_faces(ref_path, detector_backend='retinaface')
-    if ref_faces:
-        ref_crop = ref_faces[0]["face"]
-        st.image(ref_crop, caption="🖼️ Cropped Reference Face")
+# Load and encode reference image
+if reference_image_file is not None:
+    reference_image = face_recognition.load_image_file(reference_image_file)
+    reference_face_encodings = face_recognition.face_encodings(reference_image)
+    if reference_face_encodings:
+        reference_encoding = reference_face_encodings[0]
+        st.success("Reference face encoded successfully!")
     else:
-        st.warning("❌ No face detected in reference image.")
+        st.error("No face detected in the reference image. Try another one.")
+        reference_encoding = None
+else:
+    reference_encoding = None
 
-    st.success("✅ Reference image loaded! Now start webcam and press Capture.")
-
-    class VideoProcessor(VideoTransformerBase):
-        def __init__(self):
-            self.capture_now = False
-            self.captured_frame = None
-
+# Stream video from webcam
+if start_recognition and reference_encoding is not None:
+    class FaceMatch(VideoTransformerBase):
         def transform(self, frame):
-            img = frame.to_ndarray(format="bgr24")
-            if self.capture_now:
-                self.captured_frame = img.copy()
-                self.capture_now = False
-            return img
+            frame_rgb = cv2.cvtColor(frame.to_ndarray(format="bgr24"), cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(frame_rgb)
+            face_encodings = face_recognition.face_encodings(frame_rgb, face_locations)
 
-    ctx = webrtc_streamer(key="live-stream", video_processor_factory=VideoProcessor)
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                match = face_recognition.compare_faces([reference_encoding], face_encoding, tolerance=0.5)[0]
+                label = "MATCH" if match else "No Match"
+                color = (0, 255, 0) if match else (0, 0, 255)
 
-    if ctx.video_processor:
-        if st.button("📸 Capture & Compare"):
-            ctx.video_processor.capture_now = True
+                cv2.rectangle(frame_rgb, (left, top), (right, bottom), color, 2)
+                cv2.putText(frame_rgb, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        if ctx.video_processor.captured_frame is not None:
-            live_img = ctx.video_processor.captured_frame
-            st.image(live_img, caption="📷 Captured Live Image", use_column_width=True)
+            return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            enhanced = enhance_image(live_img)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as live_temp:
-                cv2.imwrite(live_temp.name, enhanced)
-                live_path = live_temp.name
-
-            try:
-                st.info("🔍 Verifying...")
-                result = DeepFace.verify(
-                    img1_path=ref_path,
-                    img2_path=live_path,
-                    model_name="ArcFace",
-                    detector_backend="retinaface",
-                    enforce_detection=True
-                )
-
-                score = 1 - result["distance"]
-                st.metric(label="Similarity Score", value=f"{score:.4f}")
-
-                # Extract faces to show side-by-side comparison
-                live_faces = DeepFace.extract_faces(live_path, detector_backend='retinaface')
-                if ref_faces and live_faces:
-                    st.image([ref_crop, live_faces[0]["face"]], caption=["Reference Face", "Live Face"])
-
-                if result["verified"]:
-                    st.success("🎉 Face Matched!")
-                    st.balloons()
-                else:
-                    st.warning("❌ Face Not Matched.")
-
-                # Log the result
-                log_path = "match_log.csv"
-                log_df = pd.read_csv(log_path) if os.path.exists(log_path) else pd.DataFrame(columns=["Timestamp", "Result", "Similarity"])
-
-                new_row = {
-                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Result": "Matched" if result["verified"] else "Not Matched",
-                    "Similarity": round(score, 4)
-                }
-
-                log_df = pd.concat([log_df, pd.DataFrame([new_row])], ignore_index=True)
-                log_df.to_csv(log_path, index=False)
-                st.info("📝 Result logged successfully.")
-
-            except Exception as e:
-                st.error(f"🚫 Verification failed: {e}")
+    webrtc_streamer(key="facematch", video_transformer_factory=FaceMatch)
