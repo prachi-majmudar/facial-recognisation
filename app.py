@@ -1,45 +1,70 @@
-import streamlit as st
-import face_recognition
+import os
 import cv2
-import numpy as np
+import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from deepface import DeepFace
+import numpy as np
+import shutil
+import tempfile
 
-st.title("Live Facial Recognition App")
-st.markdown("Upload a reference image and press the button to start recognition.")
+# Setup
+st.set_page_config(page_title="Live Facial Recognition", layout="centered")
+st.title("🧠 Real-Time Face Recognition with DeepFace")
+st.markdown("Upload a reference image, then start webcam detection.")
 
-# Upload reference image
-reference_image_file = st.file_uploader("Upload Reference Face", type=["jpg", "jpeg", "png"])
-start_recognition = st.button("Start Live Face Recognition")
+# Directories
+DB_DIR = "reference_faces"
+if not os.path.exists(DB_DIR):
+    os.makedirs(DB_DIR)
 
-# Load and encode reference image
-if reference_image_file is not None:
-    reference_image = face_recognition.load_image_file(reference_image_file)
-    reference_face_encodings = face_recognition.face_encodings(reference_image)
-    if reference_face_encodings:
-        reference_encoding = reference_face_encodings[0]
-        st.success("Reference face encoded successfully!")
-    else:
-        st.error("No face detected in the reference image. Try another one.")
-        reference_encoding = None
-else:
-    reference_encoding = None
+# Upload image
+uploaded_file = st.file_uploader("Upload Reference Image", type=["jpg", "jpeg", "png"])
+if uploaded_file is not None:
+    # Save reference image
+    ref_path = os.path.join(DB_DIR, "user.jpg")
+    with open(ref_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.image(ref_path, caption="Reference Image", width=300)
 
-# Stream video from webcam
-if start_recognition and reference_encoding is not None:
-    class FaceMatch(VideoTransformerBase):
-        def transform(self, frame):
-            frame_rgb = cv2.cvtColor(frame.to_ndarray(format="bgr24"), cv2.COLOR_BGR2RGB)
-            face_locations = face_recognition.face_locations(frame_rgb)
-            face_encodings = face_recognition.face_encodings(frame_rgb, face_locations)
+# Initialize detection state
+match_found = st.empty()
 
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                match = face_recognition.compare_faces([reference_encoding], face_encoding, tolerance=0.5)[0]
-                label = "MATCH" if match else "No Match"
-                color = (0, 255, 0) if match else (0, 0, 255)
+# Streamlit WebRTC for webcam
+class FaceMatchTransformer(VideoTransformerBase):
+    def __init__(self):
+        self.match_displayed = False
+        self.ref_img_path = os.path.join(DB_DIR, "user.jpg")
 
-                cv2.rectangle(frame_rgb, (left, top), (right, bottom), color, 2)
-                cv2.putText(frame_rgb, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    def transform(self, frame):
+        img = frame.to_ndarray(format="bgr24")
 
-            return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        try:
+            # Temporarily save webcam frame
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
+                cv2.imwrite(tmp_file.name, img)
 
-    webrtc_streamer(key="facematch", video_transformer_factory=FaceMatch)
+                result = DeepFace.verify(
+                    img1_path=self.ref_img_path,
+                    img2_path=tmp_file.name,
+                    enforce_detection=False,
+                    detector_backend="opencv",
+                    model_name="Facenet512"
+                )
+
+                if result["verified"] and not self.match_displayed:
+                    match_found.success("✅ Face Match Found!")
+                    self.match_displayed = True
+                elif not result["verified"]:
+                    match_found.warning("❌ Face Not Matching")
+        except Exception as e:
+            pass
+
+        return img
+
+if uploaded_file is not None:
+    st.markdown("### 🔍 Press the button below to start webcam recognition")
+    webrtc_streamer(
+        key="face-rec",
+        video_transformer_factory=FaceMatchTransformer,
+        media_stream_constraints={"video": True, "audio": False}
+    )
